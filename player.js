@@ -1,11 +1,10 @@
 const { Riffy } = require("riffy");
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require("discord.js");
+const { queueNames, requesters } = require("./commands/play");
 const { Dynamic } = require("musicard");
 const config = require("./config.js");
 const fs = require("fs");
 const path = require("path");
-
-let autoplayEnabled = new Map(); // Map to track autoplay status for each guild
 
 function initializePlayer(client) {
     const nodes = config.nodes.map(node => ({
@@ -22,6 +21,7 @@ function initializePlayer(client) {
         send: (payload) => {
             const guildId = payload.d.guild_id;
             if (!guildId) return;
+
             const guild = client.guilds.cache.get(guildId);
             if (guild) guild.shard.send(payload);
         },
@@ -43,6 +43,7 @@ function initializePlayer(client) {
     client.riffy.on("trackStart", async (player, track) => {
         const channel = client.channels.cache.get(player.textChannel);
         const trackUri = track.info.uri;
+        const requester = requesters.get(trackUri);
 
         try {
             const musicard = await Dynamic({
@@ -57,22 +58,26 @@ function initializePlayer(client) {
                 authorColor: '#696969',
             });
 
+            // Save the generated card to a file
             const cardPath = path.join(__dirname, 'musicard.png');
             fs.writeFileSync(cardPath, musicard);
 
+            // Prepare the attachment and embed
             const attachment = new AttachmentBuilder(cardPath, { name: 'musicard.png' });
             const embed = new EmbedBuilder()
                 .setAuthor({
                     name: 'Now Playing',
-                    iconURL: 'https://cdn.discordapp.com/emojis/838704777436200981.gif'
+                    iconURL: 'https://cdn.discordapp.com/emojis/838704777436200981.gif' // Replace with actual icon URL
                 })
-                .setDescription('🎶 **Controls:**\n 🔁 `Loop`, ❌ `Disable`, ⏭️ `Skip`, 📜 `Queue`, 🗑️ `Clear`\n ⏹️ `Stop`, ⏸️ `Pause`, ▶️ `Resume`, 🔊 `Vol +`, 🔉 `Vol -`\n 🔄 `Autoplay: ' + (autoplayEnabled.get(player.guildId) ? "Enabled" : "Disabled") + '`')
+                .setDescription('🎶 **Controls:**\n 🔁 `Loop`, ❌ `Disable`, ⏭️ `Skip`, 📜 `Queue`, 🗑️ `Clear`\n ⏹️ `Stop`, ⏸️ `Pause`, ▶️ `Resume`, 🔊 `Vol +`, 🔉 `Vol -`')
                 .setImage('attachment://musicard.png')
                 .setColor('#FF7A00');
 
+            // Action rows for music controls
             const actionRow1 = createActionRow1(false);
             const actionRow2 = createActionRow2(false);
 
+            // Send the message and set up the collector
             const message = await channel.send({
                 embeds: [embed],
                 files: [attachment],
@@ -84,7 +89,7 @@ function initializePlayer(client) {
             collector = setupCollector(client, player, channel, message);
 
         } catch (error) {
-            console.error("Error generating music card:", error);
+            console.error("Error creating or sending music card:", error.message);
             const errorEmbed = new EmbedBuilder()
                 .setColor('#FF0000')
                 .setDescription("⚠️ **Unable to load track card. Continuing playback...**");
@@ -92,28 +97,33 @@ function initializePlayer(client) {
         }
     });
 
-    client.riffy.on("queueEnd", async (player) => {
-        if (autoplayEnabled.get(player.guildId)) {
-            const channel = client.channels.cache.get(player.textChannel);
-            await sendEmbed(channel, "🔄 **Autoplay is enabled! Playing next track...**");
+    client.riffy.on("trackEnd", async (player) => {
+        await disableTrackMessage(client, player);
+        currentTrackMessageId = null;
 
-            // Get the next track (autoplay logic)
-            const nextTrack = await getNextTrack(player.guildId); // You can define getNextTrack logic
-            if (nextTrack) {
+        // Implement autoplay: Play the next track in queue automatically
+        if (config.autoPlay) {
+            if (player.queue.length > 0) {
+                const nextTrack = player.queue.shift(); // Remove the first track in the queue
                 player.play(nextTrack);
-            } else {
-                await sendEmbed(channel, "❌ **No more tracks available for autoplay.**");
-                player.stop();
             }
-        } else {
-            const channel = client.channels.cache.get(player.textChannel);
-            await sendEmbed(channel, "**Queue ended! Disconnecting...**");
-            player.destroy();
         }
     });
 
-    client.riffy.on("trackEnd", async (player) => {
+    client.riffy.on("playerDisconnect", async (player) => {
         await disableTrackMessage(client, player);
+        currentTrackMessageId = null;
+    });
+
+    client.riffy.on("queueEnd", async (player) => {
+        const channel = client.channels.cache.get(player.textChannel);
+        if (channel && currentTrackMessageId) {
+            const queueEmbed = new EmbedBuilder()
+                .setColor(config.embedColor)
+                .setDescription('**Queue Songs ended! Disconnecting Bot!**');
+            await channel.send({ embeds: [queueEmbed] });
+        }
+        player.destroy();
         currentTrackMessageId = null;
     });
 
@@ -132,109 +142,106 @@ function initializePlayer(client) {
             console.error("Failed to disable message components:", error);
         }
     }
+}
 
-    function setupCollector(client, player, channel, message) {
-        const filter = i => [
-            'loopToggle', 'skipTrack', 'disableLoop', 'showQueue', 'clearQueue',
-            'stopTrack', 'pauseTrack', 'resumeTrack', 'volumeUp', 'volumeDown', 'toggleAutoplay'
-        ].includes(i.customId);
+function setupCollector(client, player, channel, message) {
+    const filter = i => [
+        'loopToggle', 'skipTrack', 'disableLoop', 'showQueue', 'clearQueue',
+        'stopTrack', 'pauseTrack', 'resumeTrack', 'volumeUp', 'volumeDown'
+    ].includes(i.customId);
 
-        const collector = message.createMessageComponentCollector({ filter, time: 600000 });
+    const collector = message.createMessageComponentCollector({ filter, time: 600000 });
 
-        collector.on('collect', async i => {
-            await i.deferUpdate();
-            handleInteraction(i, player, channel);
-        });
+    collector.on('collect', async i => {
+        await i.deferUpdate();
 
-        collector.on('end', () => {
-            console.log("Collector stopped.");
-        });
+        const member = i.member;
+        const voiceChannel = member.voice.channel;
+        const playerChannel = player.voiceChannel;
 
-        return collector;
-    }
-
-    async function handleInteraction(i, player, channel) {
-        switch (i.customId) {
-            case 'loopToggle':
-                toggleLoop(player, channel);
-                break;
-            case 'skipTrack':
-                player.stop();
-                await sendEmbed(channel, "⏭️ **Skipping to the next track!**");
-                break;
-            case 'disableLoop':
-                disableLoop(player, channel);
-                break;
-            case 'showQueue':
-                showQueue(channel);
-                break;
-            case 'clearQueue':
-                player.queue.clear();
-                await sendEmbed(channel, "🗑️ **Queue has been cleared!**");
-                break;
-            case 'stopTrack':
-                player.stop();
-                player.destroy();
-                await sendEmbed(channel, '⏹️ **Stopped and destroyed player!**');
-                break;
-            case 'pauseTrack':
-                player.pause(true);
-                await sendEmbed(channel, '⏸️ **Paused playback!**');
-                break;
-            case 'resumeTrack':
-                player.pause(false);
-                await sendEmbed(channel, '▶️ **Resumed playback!**');
-                break;
-            case 'volumeUp':
-                adjustVolume(player, channel, 10);
-                break;
-            case 'volumeDown':
-                adjustVolume(player, channel, -10);
-                break;
-            case 'toggleAutoplay':
-                toggleAutoplay(player.guildId);
-                break;
-        }
-    }
-
-    function toggleAutoplay(guildId) {
-        autoplayEnabled.set(guildId, !autoplayEnabled.get(guildId));
-        console.log(`Autoplay for guild ${guildId} is now ${autoplayEnabled.get(guildId) ? "enabled" : "disabled"}`);
-    }
-
-    async function sendEmbed(channel, message) {
-        const embed = new EmbedBuilder().setColor(config.embedColor).setDescription(message);
-        const sentMessage = await channel.send({ embeds: [embed] });
-        setTimeout(() => sentMessage.delete().catch(console.error), config.embedTimeout * 1000);
-    }
-
-    function adjustVolume(player, channel, amount) {
-        const newVolume = Math.min(100, Math.max(10, player.volume + amount));
-        if (newVolume === player.volume) {
-            sendEmbed(channel, amount > 0 ? '🔊 **Volume is already at maximum!**' : '🔉 **Volume is already at minimum!**');
-        } else {
-            player.setVolume(newVolume);
-            sendEmbed(channel, `🔊 **Volume changed to ${newVolume}%!**`);
-        }
-    }
-
-    function toggleLoop(player, channel) {
-        player.setLoop(player.loop === "track" ? "queue" : "track");
-        sendEmbed(channel, player.loop === "track" ? "🔁 **Track loop is activated!**" : "🔁 **Queue loop is activated!**");
-    }
-
-    function disableLoop(player, channel) {
-        player.setLoop("none");
-        sendEmbed(channel, "❌ **Loop is disabled!**");
-    }
-
-    function showQueue(channel) {
-        if (queueNames.length === 0) {
-            sendEmbed(channel, "The queue is empty.");
+        if (!voiceChannel || voiceChannel.id !== playerChannel) {
+            const vcEmbed = new EmbedBuilder()
+                .setColor(config.embedColor)
+                .setDescription('🔒 **You need to be in the same voice channel to use the controls!**');
+            const sentMessage = await channel.send({ embeds: [vcEmbed] });
+            setTimeout(() => sentMessage.delete().catch(console.error), config.embedTimeout * 1000);
             return;
         }
 
-        const nowPlaying = `🎵 **Now Playing:**\n${formatTrack(queueNames[0])}`;
-        const queueChunks = [];
+        handleInteraction(i, player, channel);
+    });
 
-        for (let i = 1; i < queueNames.length; i +=
+    collector.on('end', () => {
+        console.log("Collector stopped.");
+    });
+
+    return collector;
+}
+
+async function handleInteraction(i, player, channel) {
+    switch (i.customId) {
+        case 'loopToggle':
+            toggleLoop(player, channel);
+            break;
+        case 'skipTrack':
+            player.stop();
+            await sendEmbed(channel, "⏭️ **Player will play the next song!**");
+            break;
+        case 'disableLoop':
+            disableLoop(player, channel);
+            break;
+        case 'showQueue':
+            showQueue(channel);
+            break;
+        case 'clearQueue':
+            player.queue.clear();
+            await sendEmbed(channel, "🗑️ **Queue has been cleared!**");
+            break;
+        case 'stopTrack':
+            player.stop();
+            player.destroy();
+            await sendEmbed(channel, '⏹️ **Playback has been stopped and player destroyed!**');
+            break;
+        case 'pauseTrack':
+            if (player.paused) {
+                await sendEmbed(channel, '⏸️ **Playback is already paused!**');
+            } else {
+                player.pause(true);
+                await sendEmbed(channel, '⏸️ **Playback has been paused!**');
+            }
+            break;
+        case 'resumeTrack':
+            if (!player.paused) {
+                await sendEmbed(channel, '▶️ **Playback is already resumed!**');
+            } else {
+                player.pause(false);
+                await sendEmbed(channel, '▶️ **Playback has been resumed!**');
+            }
+            break;
+        case 'volumeUp':
+            adjustVolume(player, channel, 10);
+            break;
+        case 'volumeDown':
+            adjustVolume(player, channel, -10);
+            break;
+    }
+}
+
+async function sendEmbed(channel, message) {
+    const embed = new EmbedBuilder().setColor(config.embedColor).setDescription(message);
+    const sentMessage = await channel.send({ embeds: [embed] });
+    setTimeout(() => sentMessage.delete().catch(console.error), config.embedTimeout * 1000);
+}
+
+function adjustVolume(player, channel, amount) {
+    const newVolume = Math.min(100, Math.max(10, player.volume + amount));
+    if (newVolume === player.volume) {
+        sendEmbed(channel, amount > 0 ? '🔊 **Volume is already at maximum!**' : '🔉 **Volume is already at minimum!**');
+    } else {
+        player.setVolume(newVolume);
+        sendEmbed(channel, `🔊 **Volume changed to ${newVolume}%!**`);
+    }
+}
+
+function toggleLoop(player, channel) {
+    player.setLoop(player.loop === "track" ? "queue" :
